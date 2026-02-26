@@ -8,7 +8,7 @@ Target : kf-dev-ops-p001.billing.fact_cloud_costs
 
 Strategy:
   1. Fetch the current pending invoice (this month's accumulating charges)
-  2. Also fetch the most recent closed invoice (covers last month)
+  2. Paginate through all closed invoices, include those whose period overlaps billing_date
   3. Filter all line items where startDate matches billing_date
   4. Each line item = one row in fact_cloud_costs
 
@@ -34,7 +34,8 @@ Env vars (optional):
 import os
 import argparse
 import logging
-from datetime import date, timedelta
+import time
+from datetime import date, timedelta, datetime, timezone
 
 import requests
 from requests.auth import HTTPDigestAuth
@@ -62,22 +63,61 @@ BASE_URL = "https://cloud.mongodb.com/api/atlas/v1.0"
 AUTH     = HTTPDigestAuth(PUBLIC_KEY, PRIVATE_KEY)
 HEADERS  = {"Accept": "application/json", "Content-Type": "application/json"}
 
+_MAX_RETRIES   = 3
+_RETRY_BACKOFF = 5   # seconds, doubles each attempt
+_PAGE_SIZE     = 100
+
 
 # ── Atlas API ─────────────────────────────────────────────────────────────────
 
-def atlas_get(path: str) -> dict | None:
-    url = f"{BASE_URL}{path}"
-    resp = requests.get(url, auth=AUTH, headers=HEADERS, timeout=30)
-    if resp.status_code == 200:
-        return resp.json()
-    log.warning(f"[MongoDB] GET {path} → {resp.status_code}: {resp.text[:200]}")
+def atlas_get(path: str, params: dict | None = None) -> dict | None:
+    """GET from Atlas API with exponential backoff on 429/5xx."""
+    url   = f"{BASE_URL}{path}"
+    delay = _RETRY_BACKOFF
+    for attempt in range(1, _MAX_RETRIES + 1):
+        resp = requests.get(url, auth=AUTH, headers=HEADERS, params=params, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if attempt == _MAX_RETRIES:
+                log.error(f"[MongoDB] GET {path} → {resp.status_code} after {_MAX_RETRIES} attempts")
+                return None
+            log.warning(f"[MongoDB] GET {path} → {resp.status_code}, retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        log.warning(f"[MongoDB] GET {path} → {resp.status_code}: {resp.text[:200]}")
+        return None
     return None
+
+
+def paginate_invoices() -> list[dict]:
+    """
+    Fetch all closed invoices from the Atlas invoices list API, paginating through
+    all pages. Atlas uses pageNum (1-based) + itemsPerPage.
+    """
+    invoices = []
+    page_num = 1
+    while True:
+        data = atlas_get(
+            f"/orgs/{ORG_ID}/invoices",
+            params={"pageNum": page_num, "itemsPerPage": _PAGE_SIZE},
+        )
+        if not data:
+            break
+        results = data.get("results", [])
+        invoices.extend(results)
+        # Stop when we've received fewer results than requested (last page)
+        if len(results) < _PAGE_SIZE:
+            break
+        page_num += 1
+    return invoices
 
 
 def get_invoices_for_date(billing_date: date) -> list[dict]:
     """
     Return all invoices that may contain line items for billing_date.
-    Covers: pending invoice + invoices from the same and previous month.
+    Covers: pending invoice + paginated closed invoices whose period overlaps billing_date.
     """
     invoices = []
 
@@ -86,19 +126,15 @@ def get_invoices_for_date(billing_date: date) -> list[dict]:
     if pending:
         invoices.append(pending)
 
-    # Closed invoices — filter by date range covering billing_date's month
-    # Atlas returns invoices sorted newest-first
-    all_invoices = atlas_get(f"/orgs/{ORG_ID}/invoices")
-    if all_invoices:
-        for inv in all_invoices.get("results", []):
-            inv_id = inv.get("id", "")
-            start  = inv.get("startDate", "")[:10]
-            end    = inv.get("endDate",   "")[:10]
-            # Include invoice if its period overlaps billing_date
-            if start <= billing_date.isoformat() <= end:
-                detail = atlas_get(f"/orgs/{ORG_ID}/invoices/{inv_id}")
-                if detail:
-                    invoices.append(detail)
+    # Closed invoices — paginate through all, filter by date range
+    for inv in paginate_invoices():
+        inv_id = inv.get("id", "")
+        start  = inv.get("startDate", "")[:10]
+        end    = inv.get("endDate",   "")[:10]
+        if start <= billing_date.isoformat() <= end:
+            detail = atlas_get(f"/orgs/{ORG_ID}/invoices/{inv_id}")
+            if detail:
+                invoices.append(detail)
 
     return invoices
 
@@ -134,7 +170,7 @@ def extract_line_items(invoices: list[dict], billing_date: date) -> list[dict]:
 # ── Transform ─────────────────────────────────────────────────────────────────
 
 def to_rows(line_items: list[dict], billing_date: date) -> list[dict]:
-    now      = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+    now      = datetime.now(timezone.utc).isoformat()
     date_str = billing_date.isoformat()
     rows     = []
 
@@ -251,10 +287,10 @@ def main():
     if args.date:
         dates = [date.fromisoformat(args.date)]
     elif args.backfill:
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         dates = [today - timedelta(days=i) for i in range(1, args.backfill + 1)]
     else:
-        dates = [date.today() - timedelta(days=1)]
+        dates = [datetime.now(timezone.utc).date() - timedelta(days=1)]
 
     total = 0
     for d in dates:

@@ -1,6 +1,8 @@
-from jsonschema import validate, ValidationError
+from jsonschema import validate, ValidationError, FormatChecker
 from fastapi import HTTPException
 from .tools import TOOLS_BY_NAME
+
+_FORMAT_CHECKER = FormatChecker()
 
 
 def validate_tool_arguments(tool_name: str, arguments: dict) -> None:
@@ -10,7 +12,7 @@ def validate_tool_arguments(tool_name: str, arguments: dict) -> None:
         raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
 
     try:
-        validate(instance=arguments, schema=tool["inputSchema"])
+        validate(instance=arguments, schema=tool["inputSchema"], format_checker=_FORMAT_CHECKER)
     except ValidationError as e:
         raise HTTPException(
             status_code=400,

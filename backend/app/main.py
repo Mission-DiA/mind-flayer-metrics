@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from app.config import settings
@@ -22,7 +21,25 @@ from app.billing.query_engine import query_engine
 log = structlog.get_logger()
 
 # ── Rate limiter ──────────────────────────────────────────────────────────────
-limiter = Limiter(key_func=get_remote_address)
+
+def _get_user_identity(request: Request) -> str:
+    """
+    Identify the caller for rate limiting.
+    Priority:
+      1. X-Goog-Authenticated-User-Email — set by Google IAP on Cloud Run
+      2. X-Forwarded-For first hop — set by the GCP load balancer
+      3. direct remote addr fallback (local dev)
+    """
+    iap_user = request.headers.get("X-Goog-Authenticated-User-Email")
+    if iap_user:
+        return iap_user
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+limiter = Limiter(key_func=_get_user_identity)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(

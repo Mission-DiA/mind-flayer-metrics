@@ -26,7 +26,7 @@ Env vars (optional):
 import os
 import argparse
 import logging
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 
 from google.cloud import bigquery
 
@@ -43,6 +43,9 @@ TARGET_PROJECT = os.environ.get("TARGET_PROJECT", "kf-dev-ops-p001")
 TARGET_DATASET = os.environ.get("TARGET_DATASET", "billing")
 TARGET_TABLE   = os.environ.get("TARGET_TABLE",   "fact_cloud_costs")
 COLLECTOR_VER  = os.environ.get("COLLECTOR_VERSION", "1.0.0")
+
+# 10 GB cap by default; set MAX_BYTES_BILLED=0 to disable
+MAX_BYTES_BILLED = int(os.environ.get("MAX_BYTES_BILLED", str(10 * 1024 ** 3)))
 
 SOURCE_FULL = f"`{SOURCE_PROJECT}.{SOURCE_DATASET}.{SOURCE_TABLE}`"
 TARGET_FULL = f"`{TARGET_PROJECT}.{TARGET_DATASET}.{TARGET_TABLE}`"
@@ -106,7 +109,7 @@ SELECT
   ))                                                                  AS environment,
 
   location.region                                                     AS region,
-  TO_JSON_STRING(labels)                                              AS tags,
+  PARSE_JSON(TO_JSON_STRING(labels))                                  AS tags,
 
   CURRENT_TIMESTAMP()                                                 AS collected_at,
   CURRENT_TIMESTAMP()                                                 AS processed_at,
@@ -132,7 +135,10 @@ def collect_for_date(client: bigquery.Client, billing_date: date) -> int:
         bigquery.ScalarQueryParameter("billing_date",      "DATE",   date_str),
         bigquery.ScalarQueryParameter("collector_version", "STRING", COLLECTOR_VER),
     ]
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=params,
+        maximum_bytes_billed=MAX_BYTES_BILLED if MAX_BYTES_BILLED > 0 else None,
+    )
 
     log.info(f"[GCP] collecting {date_str} ...")
 
@@ -161,10 +167,10 @@ def main():
     if args.date:
         dates = [date.fromisoformat(args.date)]
     elif args.backfill:
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         dates = [today - timedelta(days=i) for i in range(1, args.backfill + 1)]
     else:
-        dates = [date.today() - timedelta(days=1)]  # default: yesterday
+        dates = [datetime.now(timezone.utc).date() - timedelta(days=1)]
 
     total = 0
     for d in dates:

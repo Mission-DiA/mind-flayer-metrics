@@ -35,7 +35,8 @@ Env vars (optional):
 import os
 import argparse
 import logging
-from datetime import date, timedelta
+import time
+from datetime import date, timedelta, datetime, timezone
 
 import snowflake.connector
 from google.cloud import bigquery
@@ -95,16 +96,30 @@ METERING_SQL = """
 
 # ── Snowflake fetch ───────────────────────────────────────────────────────────
 
-def connect() -> snowflake.connector.SnowflakeConnection:
-    return snowflake.connector.connect(
-        account=SF_ACCOUNT,
-        user=SF_USER,
-        password=SF_PASSWORD,
-        role=SF_ROLE,
-        warehouse=SF_WAREHOUSE,
-        database="SNOWFLAKE",
-        schema="ORGANIZATION_USAGE",
-    )
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = 5  # seconds, doubles each attempt
+
+
+def connect(retries: int = _MAX_RETRIES) -> snowflake.connector.SnowflakeConnection:
+    """Connect to Snowflake with exponential backoff on transient failures."""
+    delay = _RETRY_BACKOFF
+    for attempt in range(1, retries + 1):
+        try:
+            return snowflake.connector.connect(
+                account=SF_ACCOUNT,
+                user=SF_USER,
+                password=SF_PASSWORD,
+                role=SF_ROLE,
+                warehouse=SF_WAREHOUSE,
+                database="SNOWFLAKE",
+                schema="ORGANIZATION_USAGE",
+            )
+        except Exception as e:
+            if attempt == retries:
+                raise
+            log.warning(f"[Snowflake] connect attempt {attempt} failed ({e}), retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2
 
 
 def fetch_org_usage(cursor, billing_date: date) -> list[dict]:
@@ -267,10 +282,10 @@ def main():
     if args.date:
         dates = [date.fromisoformat(args.date)]
     elif args.backfill:
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         dates = [today - timedelta(days=i) for i in range(1, args.backfill + 1)]
     else:
-        dates = [date.today() - timedelta(days=1)]
+        dates = [datetime.now(timezone.utc).date() - timedelta(days=1)]
 
     total = 0
     try:

@@ -1,5 +1,4 @@
-# 13 MCP billing tool definitions.
-# Schemas are stubs — T10 fills in complete inputSchema for each tool.
+# 13 MCP billing tool definitions with complete inputSchema per tool.
 
 BILLING_TOOLS: list[dict] = [
     {
@@ -7,6 +6,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Query cloud billing costs using natural language",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "query": {
                     "type": "string",
@@ -26,6 +26,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get total cloud spend summary for a date range",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "start_date": {"type": "string", "format": "date"},
                 "end_date": {"type": "string", "format": "date"},
@@ -39,6 +40,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get cost breakdown by cloud service",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "start_date": {"type": "string", "format": "date"},
                 "end_date": {"type": "string", "format": "date"},
@@ -53,6 +55,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get cost breakdown and comparison across cloud providers",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "start_date": {"type": "string", "format": "date"},
                 "end_date": {"type": "string", "format": "date"},
@@ -69,6 +72,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get cost breakdown by team label",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "start_date": {"type": "string", "format": "date"},
                 "end_date": {"type": "string", "format": "date"},
@@ -82,6 +86,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get cost breakdown by environment (production, staging, development)",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "start_date": {"type": "string", "format": "date"},
                 "end_date": {"type": "string", "format": "date"},
@@ -98,6 +103,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get cost breakdown by geographic region",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "start_date": {"type": "string", "format": "date"},
                 "end_date": {"type": "string", "format": "date"},
@@ -111,6 +117,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get cost breakdown and comparison across cloud accounts/projects",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "start_date": {"type": "string", "format": "date"},
                 "end_date": {"type": "string", "format": "date"},
@@ -124,6 +131,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get daily cost time series for trend analysis",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 30},
                 "provider": {"type": "string", "enum": ["GCP", "AWS", "Snowflake", "MongoDB"]}
@@ -136,6 +144,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get weekly cost time series for trend analysis",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "weeks": {"type": "integer", "minimum": 1, "maximum": 52, "default": 12},
                 "provider": {"type": "string", "enum": ["GCP", "AWS", "Snowflake", "MongoDB"]}
@@ -148,6 +157,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Compare costs between two calendar months",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "current_month": {
                     "type": "string",
@@ -169,6 +179,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Get the most expensive individual cloud resources",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "start_date": {"type": "string", "format": "date"},
                 "end_date": {"type": "string", "format": "date"},
@@ -183,6 +194,7 @@ BILLING_TOOLS: list[dict] = [
         "description": "Find resources missing team/environment labels — cost allocation gaps",
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "provider": {"type": "string", "enum": ["GCP", "AWS", "Snowflake", "MongoDB"]},
                 "days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 30}

@@ -3,7 +3,7 @@
 AWS Billing Collector
 Reads from AWS Cost Explorer API → writes to billing.fact_cloud_costs.
 
-Source : AWS Cost Explorer (boto3) — grouped by SERVICE + LINKED_ACCOUNT + REGION
+Source : AWS Cost Explorer (boto3) — grouped by SERVICE + LINKED_ACCOUNT
 Target : kf-dev-ops-p001.billing.fact_cloud_costs
 
 Usage:
@@ -16,7 +16,7 @@ Env vars (required):
     AWS_SECRET_ACCESS_KEY
 
 Env vars (optional):
-    AWS_REGION          default: us-east-1
+    AWS_REGION          default: us-east-1  (used as fallback when CE can't determine region)
     TARGET_PROJECT      default: kf-dev-ops-p001
     TARGET_DATASET      default: billing
     TARGET_TABLE        default: fact_cloud_costs
@@ -26,7 +26,7 @@ Env vars (optional):
 import os
 import argparse
 import logging
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 
 import boto3
 from google.cloud import bigquery
@@ -54,13 +54,10 @@ def fetch_daily_costs(ce_client, billing_date: date) -> list[dict]:
     """
     Fetch daily AWS costs from Cost Explorer grouped by SERVICE + LINKED_ACCOUNT.
     Returns a list of row dicts ready for BigQuery insertion.
-
-    Note: Cost Explorer API end date is exclusive, so we add 1 day.
     """
     date_str  = billing_date.isoformat()
     next_date = (billing_date + timedelta(days=1)).isoformat()
 
-    # Primary fetch: SERVICE + LINKED_ACCOUNT (max 2 GroupBy dimensions)
     response = ce_client.get_cost_and_usage(
         TimePeriod={"Start": date_str, "End": next_date},
         Granularity="DAILY",
@@ -72,7 +69,7 @@ def fetch_daily_costs(ce_client, billing_date: date) -> list[dict]:
     )
 
     rows = []
-    now = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+    now = datetime.now(timezone.utc).isoformat()
 
     for result in response.get("ResultsByTime", []):
         for group in result.get("Groups", []):
@@ -89,7 +86,7 @@ def fetch_daily_costs(ce_client, billing_date: date) -> list[dict]:
                 "billing_date":      date_str,
                 "provider":          "AWS",
                 "account_id":        account_id,
-                "account_name":      None,   # enriched below if account map provided
+                "account_name":      None,   # enriched below
                 "project_id":        account_id,
                 "service_name":      service_name,
                 "sku":               None,
@@ -104,7 +101,7 @@ def fetch_daily_costs(ce_client, billing_date: date) -> list[dict]:
                 "usage_unit":        usage_unit or None,
                 "team":              "unknown",
                 "environment":       "unknown",
-                "region":            AWS_REGION,
+                "region":            None,   # enriched below
                 "tags":              None,
                 "collected_at":      now,
                 "processed_at":      now,
@@ -115,11 +112,48 @@ def fetch_daily_costs(ce_client, billing_date: date) -> list[dict]:
     return rows
 
 
-def fetch_tag_costs(ce_client, billing_date: date, tag_key: str) -> dict[tuple, str]:
+def fetch_tag_by_account(ce_client, billing_date: date, tag_key: str) -> dict[str, str]:
     """
-    Secondary fetch: get tag values per (service, account) for team/environment.
-    Returns {(service, account): tag_value}.
-    Cost Explorer only allows 2 GroupBy dimensions, so this is a separate call.
+    Fetch tag values keyed by LINKED_ACCOUNT for team/environment enrichment.
+    Groups by LINKED_ACCOUNT + TAG so each account gets its own tag value,
+    avoiding cross-account misattribution.
+    Returns {account_id: tag_value}.
+    """
+    date_str  = billing_date.isoformat()
+    next_date = (billing_date + timedelta(days=1)).isoformat()
+
+    try:
+        response = ce_client.get_cost_and_usage(
+            TimePeriod={"Start": date_str, "End": next_date},
+            Granularity="DAILY",
+            Metrics=["UnblendedCost"],
+            GroupBy=[
+                {"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"},
+                {"Type": "TAG",       "Key": tag_key},
+            ],
+        )
+    except Exception as e:
+        log.warning(f"[AWS] tag fetch for '{tag_key}' failed (tags may not be enabled): {e}")
+        return {}
+
+    mapping: dict[str, str] = {}
+    for result in response.get("ResultsByTime", []):
+        for group in result.get("Groups", []):
+            account   = group["Keys"][0]
+            tag_value = group["Keys"][1].replace(f"{tag_key}$", "").lower().strip()
+            cost      = float(group["Metrics"]["UnblendedCost"]["Amount"])
+            # Keep the tag from the highest-cost group per account
+            if tag_value and (account not in mapping or cost > 0):
+                mapping[account] = tag_value
+
+    return mapping
+
+
+def fetch_region_by_service(ce_client, billing_date: date) -> dict[str, str]:
+    """
+    Fetch dominant region per service from Cost Explorer (SERVICE + REGION).
+    CE only allows 2 GroupBy dims so this is a separate call from the primary fetch.
+    Returns {service_name: dominant_region}.
     """
     date_str  = billing_date.isoformat()
     next_date = (billing_date + timedelta(days=1)).isoformat()
@@ -131,22 +165,24 @@ def fetch_tag_costs(ce_client, billing_date: date, tag_key: str) -> dict[tuple, 
             Metrics=["UnblendedCost"],
             GroupBy=[
                 {"Type": "DIMENSION", "Key": "SERVICE"},
-                {"Type": "TAG",       "Key": tag_key},
+                {"Type": "DIMENSION", "Key": "REGION"},
             ],
         )
     except Exception as e:
-        log.warning(f"[AWS] tag fetch for '{tag_key}' failed (tags may not be enabled): {e}")
+        log.warning(f"[AWS] region fetch failed: {e}")
         return {}
 
-    mapping = {}
+    # Per service, pick the region with the highest cost
+    best: dict[str, tuple[float, str]] = {}  # service -> (max_cost, region)
     for result in response.get("ResultsByTime", []):
         for group in result.get("Groups", []):
-            service    = group["Keys"][0]
-            tag_value  = group["Keys"][1].replace(f"{tag_key}$", "").lower().strip()
-            if tag_value:
-                mapping[service] = tag_value
+            service = group["Keys"][0]
+            region  = group["Keys"][1]
+            cost    = float(group["Metrics"]["UnblendedCost"]["Amount"])
+            if region and (service not in best or cost > best[service][0]):
+                best[service] = (cost, region)
 
-    return mapping
+    return {svc: region for svc, (_, region) in best.items()}
 
 
 # ── BigQuery write ────────────────────────────────────────────────────────────
@@ -187,18 +223,20 @@ def collect_for_date(
         log.info(f"[AWS] {billing_date} — no data")
         return 0
 
-    # Enrich team/environment from cost allocation tags (best-effort)
-    team_map = fetch_tag_costs(ce_client, billing_date, "team")
-    env_map  = fetch_tag_costs(ce_client, billing_date, "environment")
+    # Enrich team/environment from cost allocation tags, keyed by account
+    team_map   = fetch_tag_by_account(ce_client, billing_date, "team")
+    env_map    = fetch_tag_by_account(ce_client, billing_date, "environment")
+    region_map = fetch_region_by_service(ce_client, billing_date)
 
     for row in rows:
-        svc = row["service_name"]
-        if svc in team_map:
-            row["team"] = team_map[svc]
-        if svc in env_map:
-            row["environment"] = env_map[svc]
+        acct = row["account_id"]
+        svc  = row["service_name"]
+        if acct in team_map:
+            row["team"] = team_map[acct]
+        if acct in env_map:
+            row["environment"] = env_map[acct]
+        row["region"] = region_map.get(svc, AWS_REGION)
 
-    # Idempotent: delete then insert
     delete_existing(bq_client, billing_date)
     count = insert_rows(bq_client, rows)
     log.info(f"[AWS] {billing_date} — {count} rows inserted")
@@ -223,10 +261,10 @@ def main():
     if args.date:
         dates = [date.fromisoformat(args.date)]
     elif args.backfill:
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         dates = [today - timedelta(days=i) for i in range(1, args.backfill + 1)]
     else:
-        dates = [date.today() - timedelta(days=1)]
+        dates = [datetime.now(timezone.utc).date() - timedelta(days=1)]
 
     total = 0
     for d in dates:
