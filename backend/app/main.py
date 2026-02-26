@@ -32,7 +32,8 @@ def _get_user_identity(request: Request) -> str:
     """
     iap_user = request.headers.get("X-Goog-Authenticated-User-Email")
     if iap_user:
-        return iap_user
+        # IAP sets the header as "accounts.google.com:user@example.com" — strip the prefix
+        return iap_user.split(":")[-1]
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
         return forwarded_for.split(",")[0].strip()

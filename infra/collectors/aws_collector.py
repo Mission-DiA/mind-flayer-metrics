@@ -117,7 +117,7 @@ def fetch_tag_by_account(ce_client, billing_date: date, tag_key: str) -> dict[st
     Fetch tag values keyed by LINKED_ACCOUNT for team/environment enrichment.
     Groups by LINKED_ACCOUNT + TAG so each account gets its own tag value,
     avoiding cross-account misattribution.
-    Returns {account_id: tag_value}.
+    Returns {account_id: tag_value} — tag chosen by highest spend for that account.
     """
     date_str  = billing_date.isoformat()
     next_date = (billing_date + timedelta(days=1)).isoformat()
@@ -136,24 +136,27 @@ def fetch_tag_by_account(ce_client, billing_date: date, tag_key: str) -> dict[st
         log.warning(f"[AWS] tag fetch for '{tag_key}' failed (tags may not be enabled): {e}")
         return {}
 
-    mapping: dict[str, str] = {}
+    mapping:   dict[str, str]   = {}
+    best_cost: dict[str, float] = {}  # track max cost per account to pick dominant tag
+
     for result in response.get("ResultsByTime", []):
         for group in result.get("Groups", []):
             account   = group["Keys"][0]
             tag_value = group["Keys"][1].replace(f"{tag_key}$", "").lower().strip()
             cost      = float(group["Metrics"]["UnblendedCost"]["Amount"])
-            # Keep the tag from the highest-cost group per account
-            if tag_value and (account not in mapping or cost > 0):
-                mapping[account] = tag_value
+            if tag_value and (account not in best_cost or cost > best_cost[account]):
+                best_cost[account] = cost
+                mapping[account]   = tag_value
 
     return mapping
 
 
-def fetch_region_by_service(ce_client, billing_date: date) -> dict[str, str]:
+def fetch_region_by_account(ce_client, billing_date: date) -> dict[str, str]:
     """
-    Fetch dominant region per service from Cost Explorer (SERVICE + REGION).
+    Fetch dominant region per LINKED_ACCOUNT from Cost Explorer (LINKED_ACCOUNT + REGION).
+    Keying by account is more accurate than by service for multi-account, multi-region setups.
     CE only allows 2 GroupBy dims so this is a separate call from the primary fetch.
-    Returns {service_name: dominant_region}.
+    Returns {account_id: dominant_region}.
     """
     date_str  = billing_date.isoformat()
     next_date = (billing_date + timedelta(days=1)).isoformat()
@@ -164,7 +167,7 @@ def fetch_region_by_service(ce_client, billing_date: date) -> dict[str, str]:
             Granularity="DAILY",
             Metrics=["UnblendedCost"],
             GroupBy=[
-                {"Type": "DIMENSION", "Key": "SERVICE"},
+                {"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"},
                 {"Type": "DIMENSION", "Key": "REGION"},
             ],
         )
@@ -172,17 +175,17 @@ def fetch_region_by_service(ce_client, billing_date: date) -> dict[str, str]:
         log.warning(f"[AWS] region fetch failed: {e}")
         return {}
 
-    # Per service, pick the region with the highest cost
-    best: dict[str, tuple[float, str]] = {}  # service -> (max_cost, region)
+    # Per account, pick the region with the highest cost
+    best: dict[str, tuple[float, str]] = {}  # account -> (max_cost, region)
     for result in response.get("ResultsByTime", []):
         for group in result.get("Groups", []):
-            service = group["Keys"][0]
+            account = group["Keys"][0]
             region  = group["Keys"][1]
             cost    = float(group["Metrics"]["UnblendedCost"]["Amount"])
-            if region and (service not in best or cost > best[service][0]):
-                best[service] = (cost, region)
+            if region and (account not in best or cost > best[account][0]):
+                best[account] = (cost, region)
 
-    return {svc: region for svc, (_, region) in best.items()}
+    return {acct: region for acct, (_, region) in best.items()}
 
 
 # ── BigQuery write ────────────────────────────────────────────────────────────
@@ -223,19 +226,18 @@ def collect_for_date(
         log.info(f"[AWS] {billing_date} — no data")
         return 0
 
-    # Enrich team/environment from cost allocation tags, keyed by account
+    # Enrich team/environment/region from CE, all keyed by account
     team_map   = fetch_tag_by_account(ce_client, billing_date, "team")
     env_map    = fetch_tag_by_account(ce_client, billing_date, "environment")
-    region_map = fetch_region_by_service(ce_client, billing_date)
+    region_map = fetch_region_by_account(ce_client, billing_date)
 
     for row in rows:
         acct = row["account_id"]
-        svc  = row["service_name"]
         if acct in team_map:
             row["team"] = team_map[acct]
         if acct in env_map:
             row["environment"] = env_map[acct]
-        row["region"] = region_map.get(svc, AWS_REGION)
+        row["region"] = region_map.get(acct, AWS_REGION)
 
     delete_existing(bq_client, billing_date)
     count = insert_rows(bq_client, rows)
