@@ -1,0 +1,32 @@
+# Python (backend)
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node.js (frontend)
+node_modules/
+.next/
+out/
+build/
+.npm
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# GCP credentials — never commit
+*.json
+!package.json
+!tsconfig.json
+
+# OS
+.DS_Store
+*.log
