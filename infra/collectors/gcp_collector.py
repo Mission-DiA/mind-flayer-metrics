@@ -9,7 +9,7 @@ Target : kf-dev-ops-p001.billing.fact_cloud_costs
 Usage:
     python gcp_collector.py                  # collects yesterday
     python gcp_collector.py --date 2026-02-25  # collects specific date
-    python gcp_collector.py --backfill 30    # backfills last N days
+    python gcp_collector.py --backfill 30    # backfills last N days (max 90)
 
 Env vars (required):
     SOURCE_PROJECT   GCP project that owns the billing export table
@@ -21,9 +21,11 @@ Env vars (optional):
     TARGET_DATASET   default: billing
     TARGET_TABLE     default: fact_cloud_costs
     COLLECTOR_VERSION  default: 1.0.0
+    MAX_BYTES_BILLED   default: 10 GB (cannot be disabled — always enforced)
 """
 
 import os
+import re
 import argparse
 import logging
 from datetime import date, timedelta, datetime, timezone
@@ -44,8 +46,34 @@ TARGET_DATASET = os.environ.get("TARGET_DATASET", "billing")
 TARGET_TABLE   = os.environ.get("TARGET_TABLE",   "fact_cloud_costs")
 COLLECTOR_VER  = os.environ.get("COLLECTOR_VERSION", "1.0.0")
 
-# 10 GB cap by default; set MAX_BYTES_BILLED=0 to disable
-MAX_BYTES_BILLED = int(os.environ.get("MAX_BYTES_BILLED", str(10 * 1024 ** 3)))
+# Always enforce a bytes-billed cap — cannot be disabled.
+# Default: 10 GB per query job (~$0.05). Raise via env var only if justified.
+MAX_BYTES_BILLED = max(1, int(os.environ.get("MAX_BYTES_BILLED", str(10 * 1024 ** 3))))
+
+# Backfill safety cap — prevents runaway BQ spend from accidental large values
+MAX_BACKFILL_DAYS = 90
+
+# ── Identifier validation ─────────────────────────────────────────────────────
+# Reject any env-var value that could break out of BigQuery backtick quoting
+# and inject arbitrary SQL. Only alphanumerics, hyphens, underscores permitted.
+
+_SAFE_ID = re.compile(r'^[a-zA-Z0-9_\-]+$')
+
+
+def _check_ids(**ids: str) -> None:
+    for name, value in ids.items():
+        if not _SAFE_ID.match(value):
+            raise ValueError(f"Unsafe BigQuery identifier {name}={value!r}")
+
+
+_check_ids(
+    SOURCE_PROJECT=SOURCE_PROJECT,
+    SOURCE_DATASET=SOURCE_DATASET,
+    SOURCE_TABLE=SOURCE_TABLE,
+    TARGET_PROJECT=TARGET_PROJECT,
+    TARGET_DATASET=TARGET_DATASET,
+    TARGET_TABLE=TARGET_TABLE,
+)
 
 SOURCE_FULL = f"`{SOURCE_PROJECT}.{SOURCE_DATASET}.{SOURCE_TABLE}`"
 TARGET_FULL = f"`{TARGET_PROJECT}.{TARGET_DATASET}.{TARGET_TABLE}`"
@@ -137,7 +165,7 @@ def collect_for_date(client: bigquery.Client, billing_date: date) -> int:
     ]
     job_config = bigquery.QueryJobConfig(
         query_parameters=params,
-        maximum_bytes_billed=MAX_BYTES_BILLED if MAX_BYTES_BILLED > 0 else None,
+        maximum_bytes_billed=MAX_BYTES_BILLED,  # always enforced — never None
     )
 
     log.info(f"[GCP] collecting {date_str} ...")
@@ -159,14 +187,26 @@ def main():
     parser = argparse.ArgumentParser(description="GCP billing → fact_cloud_costs")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--date",     help="Collect a specific date (YYYY-MM-DD)")
-    group.add_argument("--backfill", type=int, metavar="N", help="Backfill last N days")
+    group.add_argument("--backfill", type=int, metavar="N",
+                       help=f"Backfill last N days (max {MAX_BACKFILL_DAYS})")
     args = parser.parse_args()
 
     client = bigquery.Client(project=TARGET_PROJECT)
 
     if args.date:
-        dates = [date.fromisoformat(args.date)]
+        try:
+            parsed = date.fromisoformat(args.date)
+        except ValueError:
+            parser.error(f"Invalid date {args.date!r} — expected YYYY-MM-DD")
+        today = datetime.now(timezone.utc).date()
+        if parsed > today:
+            parser.error("--date cannot be in the future")
+        if parsed < date(2020, 1, 1):
+            parser.error("--date is before 2020-01-01")
+        dates = [parsed]
     elif args.backfill:
+        if not (1 <= args.backfill <= MAX_BACKFILL_DAYS):
+            parser.error(f"--backfill must be between 1 and {MAX_BACKFILL_DAYS}")
         today = datetime.now(timezone.utc).date()
         dates = [today - timedelta(days=i) for i in range(1, args.backfill + 1)]
     else:
@@ -177,7 +217,7 @@ def main():
         try:
             total += collect_for_date(client, d)
         except Exception as e:
-            log.error(f"[GCP] failed for {d}: {e}")
+            log.error(f"[GCP] failed for {d}: {type(e).__name__}")
             raise
 
     log.info(f"[GCP] done — {total} total rows inserted across {len(dates)} day(s)")

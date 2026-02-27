@@ -15,7 +15,7 @@ Strategy:
 Usage:
     python mongodb_collector.py                   # collects yesterday
     python mongodb_collector.py --date 2026-02-25 # collects specific date
-    python mongodb_collector.py --backfill 30     # backfills last N days
+    python mongodb_collector.py --backfill 30     # backfills last N days (max 90)
 
 Env vars (required):
     MONGODB_PUBLIC_KEY    Atlas API public key
@@ -32,6 +32,7 @@ Env vars (optional):
 """
 
 import os
+import re
 import argparse
 import logging
 import time
@@ -45,12 +46,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# NOTE: MONGODB_PUBLIC_KEY and MONGODB_PRIVATE_KEY are intentionally NOT read
+# at module level. They are read inside atlas_get() — the only function that
+# uses them — to limit the window during which the raw credential strings exist
+# as named Python objects accessible to tracebacks and debuggers.
 
-PUBLIC_KEY  = os.environ["MONGODB_PUBLIC_KEY"]
-PRIVATE_KEY = os.environ["MONGODB_PRIVATE_KEY"]
-ORG_ID      = os.environ["MONGODB_ORG_ID"]
-MDB_ENV     = os.environ.get("MONGODB_ENVIRONMENT", "unknown")
-MDB_REGION  = os.environ.get("MONGODB_REGION",      "unknown")
+ORG_ID  = os.environ["MONGODB_ORG_ID"]
+MDB_ENV = os.environ.get("MONGODB_ENVIRONMENT", "unknown")
+MDB_REGION = os.environ.get("MONGODB_REGION",   "unknown")
 
 TARGET_PROJECT = os.environ.get("TARGET_PROJECT", "kf-dev-ops-p001")
 TARGET_DATASET = os.environ.get("TARGET_DATASET", "billing")
@@ -59,34 +62,70 @@ COLLECTOR_VER  = os.environ.get("COLLECTOR_VERSION", "1.0.0")
 
 TARGET_FULL = f"`{TARGET_PROJECT}.{TARGET_DATASET}.{TARGET_TABLE}`"
 
-BASE_URL = "https://cloud.mongodb.com/api/atlas/v1.0"
-AUTH     = HTTPDigestAuth(PUBLIC_KEY, PRIVATE_KEY)
-HEADERS  = {"Accept": "application/json", "Content-Type": "application/json"}
+BASE_URL  = "https://cloud.mongodb.com/api/atlas/v1.0"
+HEADERS   = {"Accept": "application/json", "Content-Type": "application/json"}
 
 _MAX_RETRIES   = 3
 _RETRY_BACKOFF = 5   # seconds, doubles each attempt
 _PAGE_SIZE     = 100
 
+# Backfill safety cap
+MAX_BACKFILL_DAYS = 90
+
+# ── Identifier validation ─────────────────────────────────────────────────────
+
+_SAFE_ID = re.compile(r'^[a-zA-Z0-9_\-]+$')
+
+
+def _check_ids(**ids: str) -> None:
+    for name, value in ids.items():
+        if not _SAFE_ID.match(value):
+            raise ValueError(f"Unsafe BigQuery identifier {name}={value!r}")
+
+
+_check_ids(
+    TARGET_PROJECT=TARGET_PROJECT,
+    TARGET_DATASET=TARGET_DATASET,
+    TARGET_TABLE=TARGET_TABLE,
+)
 
 # ── Atlas API ─────────────────────────────────────────────────────────────────
 
 def atlas_get(path: str, params: dict | None = None) -> dict | None:
     """GET from Atlas API with exponential backoff on 429/5xx."""
+    # Read credentials here — not at module level — to avoid them persisting
+    # as named globals accessible to tracebacks and exception handlers
+    auth  = HTTPDigestAuth(
+        os.environ["MONGODB_PUBLIC_KEY"],
+        os.environ["MONGODB_PRIVATE_KEY"],
+    )
     url   = f"{BASE_URL}{path}"
     delay = _RETRY_BACKOFF
+
     for attempt in range(1, _MAX_RETRIES + 1):
-        resp = requests.get(url, auth=AUTH, headers=HEADERS, params=params, timeout=30)
+        resp = requests.get(url, auth=auth, headers=HEADERS, params=params, timeout=30)
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code == 429 or resp.status_code >= 500:
             if attempt == _MAX_RETRIES:
-                log.error(f"[MongoDB] GET {path} → {resp.status_code} after {_MAX_RETRIES} attempts")
+                # Redact ORG_ID from path in logs — it is a Secret Manager secret
+                safe_path = path.replace(ORG_ID, "***")
+                log.error(f"[MongoDB] GET {safe_path} → {resp.status_code} after {_MAX_RETRIES} attempts")
                 return None
-            log.warning(f"[MongoDB] GET {path} → {resp.status_code}, retrying in {delay}s")
+            safe_path = path.replace(ORG_ID, "***")
+            log.warning(f"[MongoDB] GET {safe_path} → {resp.status_code}, retrying in {delay}s")
             time.sleep(delay)
             delay *= 2
             continue
-        log.warning(f"[MongoDB] GET {path} → {resp.status_code}: {resp.text[:200]}")
+
+        # 4xx or unexpected status — log the Atlas error code only, never the response body
+        safe_path = path.replace(ORG_ID, "***")
+        try:
+            err_json  = resp.json()
+            err_code  = str(err_json.get('errorCode') or err_json.get('detail') or 'unknown_error')[:80]
+        except Exception:
+            err_code  = 'non-json-response'
+        log.warning(f"[MongoDB] GET {safe_path} → {resp.status_code}: {err_code}")
         return None
     return None
 
@@ -239,7 +278,7 @@ def delete_existing(bq: bigquery.Client, billing_date: date) -> None:
     cfg = bigquery.QueryJobConfig(query_parameters=[
         bigquery.ScalarQueryParameter("billing_date", "DATE", billing_date.isoformat())
     ])
-    bq.query(sql, job_config=cfg).result()
+    bq.query(sql, cfg).result()
 
 
 def insert_rows(bq: bigquery.Client, rows: list[dict]) -> int:
@@ -248,7 +287,11 @@ def insert_rows(bq: bigquery.Client, rows: list[dict]) -> int:
     target = f"{TARGET_PROJECT}.{TARGET_DATASET}.{TARGET_TABLE}"
     errors = bq.insert_rows_json(target, rows)
     if errors:
-        raise RuntimeError(f"BigQuery insert errors: {errors}")
+        first_reason = errors[0][0].get('reason', 'unknown') if errors[0] else 'unknown'
+        raise RuntimeError(
+            f"BigQuery streaming insert failed: {len(errors)} row(s), "
+            f"first error reason: {first_reason}"
+        )
     return len(rows)
 
 
@@ -279,14 +322,26 @@ def main():
     parser = argparse.ArgumentParser(description="MongoDB billing → fact_cloud_costs")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--date",     help="Collect a specific date (YYYY-MM-DD)")
-    group.add_argument("--backfill", type=int, metavar="N", help="Backfill last N days")
+    group.add_argument("--backfill", type=int, metavar="N",
+                       help=f"Backfill last N days (max {MAX_BACKFILL_DAYS})")
     args = parser.parse_args()
 
     bq = bigquery.Client(project=TARGET_PROJECT)
 
     if args.date:
-        dates = [date.fromisoformat(args.date)]
+        try:
+            parsed = date.fromisoformat(args.date)
+        except ValueError:
+            parser.error(f"Invalid date {args.date!r} — expected YYYY-MM-DD")
+        today = datetime.now(timezone.utc).date()
+        if parsed > today:
+            parser.error("--date cannot be in the future")
+        if parsed < date(2020, 1, 1):
+            parser.error("--date is before 2020-01-01")
+        dates = [parsed]
     elif args.backfill:
+        if not (1 <= args.backfill <= MAX_BACKFILL_DAYS):
+            parser.error(f"--backfill must be between 1 and {MAX_BACKFILL_DAYS}")
         today = datetime.now(timezone.utc).date()
         dates = [today - timedelta(days=i) for i in range(1, args.backfill + 1)]
     else:
@@ -297,7 +352,7 @@ def main():
         try:
             total += collect_for_date(bq, d)
         except Exception as e:
-            log.error(f"[MongoDB] failed for {d}: {e}")
+            log.error(f"[MongoDB] failed for {d}: {type(e).__name__}")
             raise
 
     log.info(f"[MongoDB] done — {total} total rows across {len(dates)} day(s)")

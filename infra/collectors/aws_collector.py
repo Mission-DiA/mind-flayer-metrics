@@ -9,7 +9,7 @@ Target : kf-dev-ops-p001.billing.fact_cloud_costs
 Usage:
     python aws_collector.py                   # collects yesterday
     python aws_collector.py --date 2026-02-25 # collects specific date
-    python aws_collector.py --backfill 30     # backfills last N days
+    python aws_collector.py --backfill 30     # backfills last N days (max 90)
 
 Env vars (required):
     AWS_ACCESS_KEY_ID
@@ -24,6 +24,7 @@ Env vars (optional):
 """
 
 import os
+import re
 import argparse
 import logging
 from datetime import date, timedelta, datetime, timezone
@@ -35,10 +36,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# NOTE: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are intentionally NOT read
+# at module level. They are read once in main() at client-construction time to
+# minimize the window during which the raw credential strings exist as named
+# Python objects accessible to tracebacks, debuggers, and exception handlers.
 
-AWS_ACCESS_KEY = os.environ["AWS_ACCESS_KEY_ID"]
-AWS_SECRET_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
-AWS_REGION     = os.environ.get("AWS_REGION", "us-east-1")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 TARGET_PROJECT = os.environ.get("TARGET_PROJECT", "kf-dev-ops-p001")
 TARGET_DATASET = os.environ.get("TARGET_DATASET", "billing")
@@ -46,6 +49,36 @@ TARGET_TABLE   = os.environ.get("TARGET_TABLE",   "fact_cloud_costs")
 COLLECTOR_VER  = os.environ.get("COLLECTOR_VERSION", "1.0.0")
 
 TARGET_FULL = f"`{TARGET_PROJECT}.{TARGET_DATASET}.{TARGET_TABLE}`"
+
+# Backfill safety cap — prevents runaway CE API spend from accidental large values
+MAX_BACKFILL_DAYS = 90
+
+# ── Identifier validation ─────────────────────────────────────────────────────
+
+_SAFE_ID = re.compile(r'^[a-zA-Z0-9_\-]+$')
+
+
+def _check_ids(**ids: str) -> None:
+    for name, value in ids.items():
+        if not _SAFE_ID.match(value):
+            raise ValueError(f"Unsafe BigQuery identifier {name}={value!r}")
+
+
+_check_ids(
+    TARGET_PROJECT=TARGET_PROJECT,
+    TARGET_DATASET=TARGET_DATASET,
+    TARGET_TABLE=TARGET_TABLE,
+)
+
+# ── Safe error extraction ─────────────────────────────────────────────────────
+
+def _aws_err(e: Exception) -> str:
+    """
+    Extract a safe error code from boto3 exceptions without leaking account
+    data. boto3 ClientError string representations include AWS account IDs,
+    ARNs, and request IDs — none of which should be written to Cloud Logging.
+    """
+    return getattr(e, 'response', {}).get('Error', {}).get('Code', type(e).__name__)
 
 
 # ── AWS fetch ─────────────────────────────────────────────────────────────────
@@ -133,7 +166,8 @@ def fetch_tag_by_account(ce_client, billing_date: date, tag_key: str) -> dict[st
             ],
         )
     except Exception as e:
-        log.warning(f"[AWS] tag fetch for '{tag_key}' failed (tags may not be enabled): {e}")
+        # Log only the error code — CE ClientError strings include account IDs and ARNs
+        log.warning(f"[AWS] tag fetch for '{tag_key}' failed: {_aws_err(e)}")
         return {}
 
     mapping:   dict[str, str]   = {}
@@ -172,7 +206,7 @@ def fetch_region_by_account(ce_client, billing_date: date) -> dict[str, str]:
             ],
         )
     except Exception as e:
-        log.warning(f"[AWS] region fetch failed: {e}")
+        log.warning(f"[AWS] region fetch failed: {_aws_err(e)}")
         return {}
 
     # Per account, pick the region with the highest cost
@@ -208,7 +242,13 @@ def insert_rows(bq_client: bigquery.Client, rows: list[dict]) -> int:
     target = f"{TARGET_PROJECT}.{TARGET_DATASET}.{TARGET_TABLE}"
     errors = bq_client.insert_rows_json(target, rows)
     if errors:
-        raise RuntimeError(f"BigQuery insert errors: {errors}")
+        # Log only the count and first error reason — not full row data which may
+        # contain account IDs or cost figures we don't want in logs
+        first_reason = errors[0][0].get('reason', 'unknown') if errors[0] else 'unknown'
+        raise RuntimeError(
+            f"BigQuery streaming insert failed: {len(errors)} row(s), "
+            f"first error reason: {first_reason}"
+        )
     return len(rows)
 
 
@@ -249,20 +289,34 @@ def main():
     parser = argparse.ArgumentParser(description="AWS billing → fact_cloud_costs")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--date",     help="Collect a specific date (YYYY-MM-DD)")
-    group.add_argument("--backfill", type=int, metavar="N", help="Backfill last N days")
+    group.add_argument("--backfill", type=int, metavar="N",
+                       help=f"Backfill last N days (max {MAX_BACKFILL_DAYS})")
     args = parser.parse_args()
 
+    # Read AWS credentials here — not at module level — to reduce the window
+    # during which raw credential strings exist as named Python objects
     ce_client = boto3.client(
         "ce",
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
         region_name=AWS_REGION,
     )
     bq_client = bigquery.Client(project=TARGET_PROJECT)
 
     if args.date:
-        dates = [date.fromisoformat(args.date)]
+        try:
+            parsed = date.fromisoformat(args.date)
+        except ValueError:
+            parser.error(f"Invalid date {args.date!r} — expected YYYY-MM-DD")
+        today = datetime.now(timezone.utc).date()
+        if parsed > today:
+            parser.error("--date cannot be in the future")
+        if parsed < date(2020, 1, 1):
+            parser.error("--date is before 2020-01-01")
+        dates = [parsed]
     elif args.backfill:
+        if not (1 <= args.backfill <= MAX_BACKFILL_DAYS):
+            parser.error(f"--backfill must be between 1 and {MAX_BACKFILL_DAYS}")
         today = datetime.now(timezone.utc).date()
         dates = [today - timedelta(days=i) for i in range(1, args.backfill + 1)]
     else:
@@ -273,7 +327,7 @@ def main():
         try:
             total += collect_for_date(ce_client, bq_client, d)
         except Exception as e:
-            log.error(f"[AWS] failed for {d}: {e}")
+            log.error(f"[AWS] failed for {d}: {_aws_err(e)}")
             raise
 
     log.info(f"[AWS] done — {total} total rows across {len(dates)} day(s)")

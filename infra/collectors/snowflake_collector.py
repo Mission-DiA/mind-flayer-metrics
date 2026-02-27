@@ -13,7 +13,7 @@ Target : kf-dev-ops-p001.billing.fact_cloud_costs
 Usage:
     python snowflake_collector.py                   # collects yesterday
     python snowflake_collector.py --date 2026-02-25 # collects specific date
-    python snowflake_collector.py --backfill 30     # backfills last N days
+    python snowflake_collector.py --backfill 30     # backfills last N days (max 90)
 
 Env vars (required):
     SNOWFLAKE_ACCOUNT    e.g. xy12345.us-east-1
@@ -33,6 +33,7 @@ Env vars (optional):
 """
 
 import os
+import re
 import argparse
 import logging
 import time
@@ -45,10 +46,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# NOTE: SNOWFLAKE_PASSWORD is intentionally NOT read at module level.
+# It is read inside connect() — the only function that needs it — to limit
+# the window during which the raw credential string exists as a named object.
 
 SF_ACCOUNT    = os.environ["SNOWFLAKE_ACCOUNT"]
 SF_USER       = os.environ["SNOWFLAKE_USER"]
-SF_PASSWORD   = os.environ["SNOWFLAKE_PASSWORD"]
 SF_ROLE       = os.environ.get("SNOWFLAKE_ROLE",      "ACCOUNTADMIN")
 SF_WAREHOUSE  = os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
 SF_ENV        = os.environ.get("SNOWFLAKE_ENVIRONMENT", "unknown")
@@ -61,6 +64,26 @@ TARGET_TABLE   = os.environ.get("TARGET_TABLE",   "fact_cloud_costs")
 COLLECTOR_VER  = os.environ.get("COLLECTOR_VERSION", "1.0.0")
 
 TARGET_FULL = f"`{TARGET_PROJECT}.{TARGET_DATASET}.{TARGET_TABLE}`"
+
+# Backfill safety cap
+MAX_BACKFILL_DAYS = 90
+
+# ── Identifier validation ─────────────────────────────────────────────────────
+
+_SAFE_ID = re.compile(r'^[a-zA-Z0-9_\-]+$')
+
+
+def _check_ids(**ids: str) -> None:
+    for name, value in ids.items():
+        if not _SAFE_ID.match(value):
+            raise ValueError(f"Unsafe BigQuery identifier {name}={value!r}")
+
+
+_check_ids(
+    TARGET_PROJECT=TARGET_PROJECT,
+    TARGET_DATASET=TARGET_DATASET,
+    TARGET_TABLE=TARGET_TABLE,
+)
 
 # ── SQL ───────────────────────────────────────────────────────────────────────
 
@@ -108,7 +131,7 @@ def connect(retries: int = _MAX_RETRIES) -> snowflake.connector.SnowflakeConnect
             return snowflake.connector.connect(
                 account=SF_ACCOUNT,
                 user=SF_USER,
-                password=SF_PASSWORD,
+                password=os.environ["SNOWFLAKE_PASSWORD"],  # read here, not at module level
                 role=SF_ROLE,
                 warehouse=SF_WAREHOUSE,
                 database="SNOWFLAKE",
@@ -117,14 +140,20 @@ def connect(retries: int = _MAX_RETRIES) -> snowflake.connector.SnowflakeConnect
         except Exception as e:
             if attempt == retries:
                 raise
-            log.warning(f"[Snowflake] connect attempt {attempt} failed ({e}), retrying in {delay}s")
+            # Log only the exception type — Snowflake connector exceptions for auth
+            # failures can include the username and connection metadata in their
+            # string representation; never log str(e) for connection errors
+            log.warning(
+                f"[Snowflake] connect attempt {attempt} failed "
+                f"({type(e).__name__}), retrying in {delay}s"
+            )
             time.sleep(delay)
             delay *= 2
 
 
 def fetch_org_usage(cursor, billing_date: date) -> list[dict]:
     """Primary: ORGANIZATION_USAGE.USAGE_IN_CURRENCY_DAILY (ORGADMIN required)."""
-    now = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+    now = datetime.now(timezone.utc).isoformat()  # timezone-aware UTC timestamp
     cursor.execute(ORG_USAGE_SQL, {"billing_date": billing_date.isoformat()})
     rows = []
     for account_name, account_locator, service_type, usage, usage_unit, cost_usd, currency in cursor:
@@ -159,7 +188,7 @@ def fetch_org_usage(cursor, billing_date: date) -> list[dict]:
 
 def fetch_metering(cursor, billing_date: date) -> list[dict]:
     """Fallback: ACCOUNT_USAGE.METERING_DAILY_HISTORY (credits × CREDIT_PRICE_USD)."""
-    now = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+    now = datetime.now(timezone.utc).isoformat()  # timezone-aware UTC timestamp
     cursor.execute(METERING_SQL, {"billing_date": billing_date.isoformat()})
     rows = []
     for service_type, warehouse_name, credits_used in cursor:
@@ -230,7 +259,11 @@ def insert_rows(bq: bigquery.Client, rows: list[dict]) -> int:
     target = f"{TARGET_PROJECT}.{TARGET_DATASET}.{TARGET_TABLE}"
     errors = bq.insert_rows_json(target, rows)
     if errors:
-        raise RuntimeError(f"BigQuery insert errors: {errors}")
+        first_reason = errors[0][0].get('reason', 'unknown') if errors[0] else 'unknown'
+        raise RuntimeError(
+            f"BigQuery streaming insert failed: {len(errors)} row(s), "
+            f"first error reason: {first_reason}"
+        )
     return len(rows)
 
 
@@ -246,7 +279,7 @@ def collect_for_date(sf_conn, bq: bigquery.Client, billing_date: date) -> int:
         rows = fetch_org_usage(cursor, billing_date)
         log.info(f"[Snowflake] {billing_date} — org usage: {len(rows)} rows")
     except Exception as e:
-        log.warning(f"[Snowflake] org usage failed ({e}), falling back to metering history")
+        log.warning(f"[Snowflake] org usage failed ({type(e).__name__}), falling back to metering history")
 
     # Fallback to metering history if org usage returned nothing
     if not rows:
@@ -254,7 +287,7 @@ def collect_for_date(sf_conn, bq: bigquery.Client, billing_date: date) -> int:
             rows = fetch_metering(cursor, billing_date)
             log.info(f"[Snowflake] {billing_date} — metering fallback: {len(rows)} rows")
         except Exception as e:
-            log.error(f"[Snowflake] metering fallback also failed: {e}")
+            log.error(f"[Snowflake] metering fallback also failed: {type(e).__name__}")
             raise
     finally:
         cursor.close()
@@ -273,15 +306,27 @@ def main():
     parser = argparse.ArgumentParser(description="Snowflake billing → fact_cloud_costs")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--date",     help="Collect a specific date (YYYY-MM-DD)")
-    group.add_argument("--backfill", type=int, metavar="N", help="Backfill last N days")
+    group.add_argument("--backfill", type=int, metavar="N",
+                       help=f"Backfill last N days (max {MAX_BACKFILL_DAYS})")
     args = parser.parse_args()
 
     sf_conn = connect()
     bq = bigquery.Client(project=TARGET_PROJECT)
 
     if args.date:
-        dates = [date.fromisoformat(args.date)]
+        try:
+            parsed = date.fromisoformat(args.date)
+        except ValueError:
+            parser.error(f"Invalid date {args.date!r} — expected YYYY-MM-DD")
+        today = datetime.now(timezone.utc).date()
+        if parsed > today:
+            parser.error("--date cannot be in the future")
+        if parsed < date(2020, 1, 1):
+            parser.error("--date is before 2020-01-01")
+        dates = [parsed]
     elif args.backfill:
+        if not (1 <= args.backfill <= MAX_BACKFILL_DAYS):
+            parser.error(f"--backfill must be between 1 and {MAX_BACKFILL_DAYS}")
         today = datetime.now(timezone.utc).date()
         dates = [today - timedelta(days=i) for i in range(1, args.backfill + 1)]
     else:
@@ -293,7 +338,7 @@ def main():
             try:
                 total += collect_for_date(sf_conn, bq, d)
             except Exception as e:
-                log.error(f"[Snowflake] failed for {d}: {e}")
+                log.error(f"[Snowflake] failed for {d}: {type(e).__name__}")
                 raise
     finally:
         sf_conn.close()
